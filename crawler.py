@@ -1,17 +1,27 @@
 import os
 import time
-import requests
+import asyncio
+import aiohttp
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urljoin
-from lxml import html
+from typing import List, Dict, Optional
+import logging
+
+# 配置日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 class ShuimuCrawler:
-    def __init__(self, save_dir='./data'):
+    def __init__(self, save_dir='./data', max_concurrency=5):
         self.base_url = 'https://www.newsmth.net'
         self.board_url = 'https://www.newsmth.net/nForum/board/OurEstate'
         self.save_dir = save_dir
-        self.session = requests.Session()
+        self.max_concurrency = max_concurrency
+        self.semaphore = asyncio.Semaphore(max_concurrency)
         self.headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
             'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
@@ -23,34 +33,32 @@ class ShuimuCrawler:
         # 创建保存目录
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
-            
-        # 初始化session
-        self._init_session()
 
-    def _init_session(self):
+    async def _init_session(self, session: aiohttp.ClientSession):
         """初始化会话，访问主页获取必要的cookies"""
         try:
-            # 先访问主页
-            self.session.get(self.base_url, headers=self.headers)
-            # 再访问版面
-            self.session.get(self.board_url, headers=self.headers)
+            async with session.get(self.base_url, headers=self.headers) as response:
+                await response.text()
+            async with session.get(self.board_url, headers=self.headers) as response:
+                await response.text()
         except Exception as e:
-            print(f"Error initializing session: {str(e)}")
+            logger.error(f"Error initializing session: {str(e)}")
 
-    def get_page_content(self, url):
+    async def get_page_content(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """获取页面内容"""
         try:
-            response = self.session.get(url, headers=self.headers)
-            response.encoding = 'gbk'  # 设置GBK编码
-            return response.text
+            async with self.semaphore:  # 使用信号量限制并发
+                async with session.get(url, headers=self.headers) as response:
+                    content = await response.text(encoding='gbk', errors='ignore')
+                    return content
         except Exception as e:
-            print(f"Error fetching {url}: {str(e)}")
+            logger.error(f"Error fetching {url}: {str(e)}")
             return None
 
-    def parse_list_page(self, page_num):
+    async def parse_list_page(self, session: aiohttp.ClientSession, page_num: int) -> List[Dict]:
         """解析列表页"""
         url = f'{self.board_url}?p={page_num}'
-        content = self.get_page_content(url)
+        content = await self.get_page_content(session, url)
         if not content:
             return []
 
@@ -76,63 +84,44 @@ class ShuimuCrawler:
                                     'title': title,
                                     'url': full_link
                                 })
-                                print(f"Found post: {title} - {full_link}")  # 调试信息
+                                logger.info(f"Found post: {title}")
                 except Exception as e:
-                    print(f"Error parsing post row: {str(e)}")
+                    logger.error(f"Error parsing post row: {str(e)}")
                     continue
         else:
-            print("Table with class 'board-list' not found!")  # 调试信息
+            logger.warning("Table with class 'board-list' not found!")
         
         return posts
 
-    def parse_detail_page(self, url):
+    async def parse_detail_page(self, session: aiohttp.ClientSession, url: str) -> Optional[str]:
         """解析详情页"""
-        content = self.get_page_content(url)
+        content = await self.get_page_content(session, url)
         if not content:
             return None
 
         try:
-            # 使用BeautifulSoup解析页面
             soup = BeautifulSoup(content, 'lxml')
-            
-            # 打印HTML结构以便调试
-            print("\nHTML Structure:")
-            # 找到所有的table元素
             tables = soup.find_all('table')
-            print(f"Found {len(tables)} tables")
             
-            # 遍历每个table，查找可能的内容
-            for i, table in enumerate(tables):
-                print(f"\nChecking table {i+1}:")
-                # 查找第二行的第二个单元格
+            for table in tables:
                 rows = table.find_all('tr')
                 if len(rows) >= 2:
                     cells = rows[1].find_all('td')
                     if len(cells) >= 2:
-                        print(f"Content in table {i+1}, row 2, cell 2:")
                         content_text = cells[1].get_text(strip=True)
-                        print(content_text[:200] + "..." if len(content_text) > 200 else content_text)
-                        
-                        # 如果这个单元格包含实际内容，就使用它
-                        if len(content_text.strip()) > 50:  # 假设真实内容长度会大于50个字符
-                            # 获取完整内容
+                        if len(content_text.strip()) > 50:
                             full_text = cells[1].get_text(separator='\n', strip=True)
-                            # 清理文本（去除多余的空白行等）
                             cleaned_content = '\n'.join(line.strip() for line in full_text.split('\n') if line.strip())
                             return cleaned_content
             
-            print("\nNo suitable content found in any table!")
-            print("Page content preview:")
-            print(content[:500])
+            logger.warning("No suitable content found in any table!")
             return None
             
         except Exception as e:
-            print(f"Error parsing article content: {str(e)}")
-            print("Page content preview:")
-            print(content[:500])
-        return None
+            logger.error(f"Error parsing article content: {str(e)}")
+            return None
 
-    def save_to_file(self, title, content):
+    async def save_to_file(self, title: str, content: str):
         """保存内容到文件"""
         # 清理文件名中的非法字符
         title = re.sub(r'[\\/*?:"<>|]', '_', title)
@@ -140,42 +129,58 @@ class ShuimuCrawler:
         
         try:
             # 使用GBK编码保存文件
-            with open(filename, 'w', encoding='gbk', errors='ignore') as f:
-                f.write(content)
-            print(f"Saved: {filename}")
+            async with asyncio.Lock():  # 使用锁来保护文件写入
+                with open(filename, 'w', encoding='gbk', errors='ignore') as f:
+                    f.write(content)
+                logger.info(f"Saved: {filename}")
             
             # 验证文件是否正确保存
             try:
                 with open(filename, 'r', encoding='gbk') as f:
                     test_content = f.read()
                 if not test_content:
-                    print(f"Warning: File {filename} appears to be empty")
+                    logger.warning(f"Warning: File {filename} appears to be empty")
             except Exception as e:
-                print(f"Warning: Unable to verify file content: {str(e)}")
+                logger.warning(f"Warning: Unable to verify file content: {str(e)}")
                 
         except Exception as e:
-            print(f"Error saving {filename}: {str(e)}")
+            logger.error(f"Error saving {filename}: {str(e)}")
 
-    def crawl(self, start_page=1, end_page=1):
-        """爬取指定页数的内容"""
-        for page_num in range(start_page, end_page + 1):
-            print(f"\nCrawling page {page_num}...")
-            posts = self.parse_list_page(page_num)
+    async def process_post(self, session: aiohttp.ClientSession, post: Dict):
+        """处理单个帖子"""
+        content = await self.parse_detail_page(session, post['url'])
+        if content:
+            await self.save_to_file(post['title'], content)
+
+    async def crawl_page(self, session: aiohttp.ClientSession, page_num: int):
+        """爬取单个页面的所有帖子"""
+        posts = await self.parse_list_page(session, page_num)
+        tasks = [self.process_post(session, post) for post in posts]
+        await asyncio.gather(*tasks)
+
+    async def crawl(self, start_page=1, end_page=1):
+        """异步爬取指定页数的内容"""
+        async with aiohttp.ClientSession() as session:
+            # 初始化session
+            await self._init_session(session)
             
-            for post in posts:
-                print(f"\nProcessing: {post['title']}")
-                content = self.parse_detail_page(post['url'])
-                if content:
-                    self.save_to_file(post['title'], content)
-                time.sleep(1)  # 添加延时，避免请求过于频繁
+            # 创建每个页面的任务
+            tasks = []
+            for page_num in range(start_page, end_page + 1):
+                logger.info(f"Creating task for page {page_num}")
+                tasks.append(self.crawl_page(session, page_num))
             
-            time.sleep(2)  # 页面之间的延时
+            # 并发执行所有任务
+            await asyncio.gather(*tasks)
 
 def main():
     # 使用示例
     save_dir = './shuimu_data'  # 可以修改保存目录
-    crawler = ShuimuCrawler(save_dir=save_dir)
-    crawler.crawl(start_page=1, end_page=1)  # 先只爬取第1页进行测试
+    max_concurrency = 5  # 最大并发数
+    crawler = ShuimuCrawler(save_dir=save_dir, max_concurrency=max_concurrency)
+    
+    # 运行异步爬虫
+    asyncio.run(crawler.crawl(start_page=1, end_page=3))  # 爬取1-3页进行测试
 
 if __name__ == '__main__':
     main()
