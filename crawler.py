@@ -5,7 +5,7 @@ import aiohttp
 from bs4 import BeautifulSoup
 import re
 from urllib.parse import urljoin
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Set
 import logging
 
 # 配置日志
@@ -33,6 +33,25 @@ class ShuimuCrawler:
         # 创建保存目录
         if not os.path.exists(save_dir):
             os.makedirs(save_dir)
+            
+        # 初始化已下载文件集合
+        self.downloaded_files = self._load_downloaded_files()
+        logger.info(f"Found {len(self.downloaded_files)} previously downloaded files")
+
+    def _load_downloaded_files(self) -> Set[str]:
+        """加载已下载的文件列表"""
+        downloaded = set()
+        if os.path.exists(self.save_dir):
+            for filename in os.listdir(self.save_dir):
+                if filename.endswith('.txt'):
+                    # 去掉.txt后缀，获取原始标题
+                    title = filename[:-4]
+                    downloaded.add(title)
+        return downloaded
+
+    def _get_safe_filename(self, title: str) -> str:
+        """获取安全的文件名"""
+        return re.sub(r'[\\/*?:"<>|]', '_', title)
 
     async def _init_session(self, session: aiohttp.ClientSession):
         """初始化会话，访问主页获取必要的cookies"""
@@ -80,11 +99,16 @@ class ShuimuCrawler:
                             if title and link:
                                 # 构建完整的帖子URL
                                 full_link = urljoin(self.base_url, link)
-                                posts.append({
-                                    'title': title,
-                                    'url': full_link
-                                })
-                                logger.info(f"Found post: {title}")
+                                # 检查是否已下载
+                                safe_title = self._get_safe_filename(title)
+                                if safe_title not in self.downloaded_files:
+                                    posts.append({
+                                        'title': title,
+                                        'url': full_link
+                                    })
+                                    logger.info(f"Found new post: {title}")
+                                else:
+                                    logger.debug(f"Skip downloaded post: {title}")
                 except Exception as e:
                     logger.error(f"Error parsing post row: {str(e)}")
                     continue
@@ -123,9 +147,8 @@ class ShuimuCrawler:
 
     async def save_to_file(self, title: str, content: str):
         """保存内容到文件"""
-        # 清理文件名中的非法字符
-        title = re.sub(r'[\\/*?:"<>|]', '_', title)
-        filename = os.path.join(self.save_dir, f"{title}.txt")
+        safe_title = self._get_safe_filename(title)
+        filename = os.path.join(self.save_dir, f"{safe_title}.txt")
         
         try:
             # 使用GBK编码保存文件
@@ -133,6 +156,8 @@ class ShuimuCrawler:
                 with open(filename, 'w', encoding='gbk', errors='ignore') as f:
                     f.write(content)
                 logger.info(f"Saved: {filename}")
+                # 添加到已下载集合
+                self.downloaded_files.add(safe_title)
             
             # 验证文件是否正确保存
             try:
@@ -148,15 +173,22 @@ class ShuimuCrawler:
 
     async def process_post(self, session: aiohttp.ClientSession, post: Dict):
         """处理单个帖子"""
-        content = await self.parse_detail_page(session, post['url'])
-        if content:
-            await self.save_to_file(post['title'], content)
+        safe_title = self._get_safe_filename(post['title'])
+        if safe_title not in self.downloaded_files:
+            content = await self.parse_detail_page(session, post['url'])
+            if content:
+                await self.save_to_file(post['title'], content)
+        else:
+            logger.debug(f"Skip processing downloaded post: {post['title']}")
 
     async def crawl_page(self, session: aiohttp.ClientSession, page_num: int):
         """爬取单个页面的所有帖子"""
         posts = await self.parse_list_page(session, page_num)
-        tasks = [self.process_post(session, post) for post in posts]
-        await asyncio.gather(*tasks)
+        if posts:
+            tasks = [self.process_post(session, post) for post in posts]
+            await asyncio.gather(*tasks)
+        else:
+            logger.info(f"No new posts found on page {page_num}")
 
     async def crawl(self, start_page=1, end_page=1):
         """异步爬取指定页数的内容"""
@@ -180,7 +212,7 @@ def main():
     crawler = ShuimuCrawler(save_dir=save_dir, max_concurrency=max_concurrency)
     
     # 运行异步爬虫
-    asyncio.run(crawler.crawl(start_page=1, end_page=3))  # 爬取1-3页进行测试
+    asyncio.run(crawler.crawl(start_page=1, end_page=1000))  # 爬取1-1000页
 
 if __name__ == '__main__':
     main()
